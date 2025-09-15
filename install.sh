@@ -334,8 +334,270 @@ if __name__ == "__main__":
     system.run()
 EOF
 
-# Copy the rest of your Python files (detector.py, sms_handler.py, camera_handler.py)
-# [I'll include these in the same format - keeping your original code]
+# detector.py
+cat > "$PROJECT_DIR/src/detector.py" << 'EOF'
+#!/usr/bin/env python3
+import torch
+import numpy as np
+import cv2
+import logging
+import os
+import urllib.request
+
+class HumanDetector:
+    def __init__(self, model_path="models/yolov5s.pt", confidence=0.5):
+        self.model_path = model_path
+        self.confidence = confidence
+        self.model = None
+        self.logger = logging.getLogger(__name__)
+        self.PERSON_CLASS_ID = 0
+        self._load_model()
+    
+    def _load_model(self):
+        try:
+            self.logger.info("Loading YOLOv5 model...")
+            self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=self.model_path, force_reload=False, verbose=False)
+            self.model.cpu()
+            self.model.conf = self.confidence
+            self.model.eval()
+            self.logger.info("YOLOv5 model loaded")
+        except Exception as e:
+            self.logger.error(f"Failed to load model: {e}")
+            raise
+    
+    def detect_humans(self, image):
+        if self.model is None:
+            return []
+        
+        try:
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            with torch.no_grad():
+                results = self.model(image_rgb, size=640)
+            
+            detections = []
+            predictions = results.pandas().xyxy[0]
+            person_detections = predictions[predictions['class'] == self.PERSON_CLASS_ID]
+            
+            for _, detection in person_detections.iterrows():
+                detections.append({
+                    'bbox': [int(detection['xmin']), int(detection['ymin']), int(detection['xmax']), int(detection['ymax'])],
+                    'confidence': float(detection['confidence'])
+                })
+            
+            return detections
+        except Exception as e:
+            self.logger.error(f"Detection error: {e}")
+            return []
+    
+    def cleanup(self):
+        if self.model:
+            del self.model
+            self.model = None
+
+if __name__ == "__main__":
+    detector = HumanDetector()
+    print("Detector test completed")
+    detector.cleanup()
+EOF
+
+# sms_handler.py
+cat > "$PROJECT_DIR/src/sms_handler.py" << 'EOF'
+#!/usr/bin/env python3
+import serial
+import time
+import logging
+import re
+
+class SMSHandler:
+    def __init__(self, phone_numbers, device_path="/dev/ttyUSB2", baud_rate=115200):
+        self.phone_numbers = phone_numbers
+        self.device_path = device_path
+        self.baud_rate = baud_rate
+        self.serial_connection = None
+        self.logger = logging.getLogger(__name__)
+        self._initialize_connection()
+    
+    def _initialize_connection(self):
+        try:
+            self.logger.info(f"Connecting to SIM7600 at {self.device_path}")
+            self.serial_connection = serial.Serial(
+                port=self.device_path,
+                baudrate=self.baud_rate,
+                timeout=10
+            )
+            time.sleep(2)
+            if self._setup_module():
+                self.logger.info("SIM7600 initialized")
+            else:
+                raise Exception("SIM7600 setup failed")
+        except Exception as e:
+            self.logger.error(f"SIM7600 connection failed: {e}")
+            self.serial_connection = None
+    
+    def _send_at_command(self, command, expected="OK", timeout=5.0):
+        if not self.serial_connection:
+            return False, "No connection"
+        
+        try:
+            self.serial_connection.reset_input_buffer()
+            self.serial_connection.write(f"{command}\r\n".encode())
+            
+            start_time = time.time()
+            response = ""
+            
+            while time.time() - start_time < timeout:
+                if self.serial_connection.in_waiting > 0:
+                    data = self.serial_connection.read(self.serial_connection.in_waiting)
+                    response += data.decode('utf-8', errors='ignore')
+                    if expected in response:
+                        return True, response.strip()
+                    if "ERROR" in response:
+                        return False, response.strip()
+                time.sleep(0.1)
+            
+            return False, f"Timeout: {command}"
+        except Exception as e:
+            return False, str(e)
+    
+    def _setup_module(self):
+        commands = [("AT", "OK"), ("ATE0", "OK"), ("AT+CMGF=1", "OK"), ("AT+CSCS=\"GSM\"", "OK")]
+        for cmd, exp in commands:
+            success, _ = self._send_at_command(cmd, exp)
+            if not success:
+                return False
+            time.sleep(0.5)
+        return True
+    
+    def send_sms(self, message):
+        if not self.phone_numbers or not self.serial_connection:
+            return False
+        
+        success_count = 0
+        for number in self.phone_numbers:
+            if self._send_sms_to_number(number, message):
+                success_count += 1
+                self.logger.info(f"SMS sent to {number}")
+            time.sleep(1)
+        
+        return success_count > 0
+    
+    def _send_sms_to_number(self, phone_number, message):
+        try:
+            if len(message) > 160:
+                message = message[:157] + "..."
+            
+            success, _ = self._send_at_command(f'AT+CMGS="{phone_number}"', ">", 10)
+            if not success:
+                return False
+            
+            self.serial_connection.write((message + chr(26)).encode())
+            
+            start_time = time.time()
+            response = ""
+            while time.time() - start_time < 30:
+                if self.serial_connection.in_waiting > 0:
+                    data = self.serial_connection.read(self.serial_connection.in_waiting)
+                    response += data.decode('utf-8', errors='ignore')
+                    if "+CMGS:" in response and "OK" in response:
+                        return True
+                    if "ERROR" in response:
+                        return False
+                time.sleep(0.5)
+            return False
+        except Exception as e:
+            self.logger.error(f"SMS error: {e}")
+            return False
+    
+    def cleanup(self):
+        if self.serial_connection:
+            self.serial_connection.close()
+            self.serial_connection = None
+
+if __name__ == "__main__":
+    handler = SMSHandler(["+1234567890"])
+    print("SMS handler test completed")
+    handler.cleanup()
+EOF
+
+# camera_handler.py
+cat > "$PROJECT_DIR/src/camera_handler.py" << 'EOF'
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import logging
+import time
+
+class CameraHandler:
+    def __init__(self, resolution=(640, 480), framerate=2):
+        self.resolution = resolution
+        self.framerate = framerate
+        self.camera = None
+        self.logger = logging.getLogger(__name__)
+        self.is_initialized = False
+        self._initialize_camera()
+    
+    def _initialize_camera(self):
+        try:
+            self.logger.info("Initializing camera...")
+            self.camera = cv2.VideoCapture(0)
+            
+            if not self.camera.isOpened():
+                raise Exception("Camera not found")
+            
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+            self.camera.set(cv2.CAP_PROP_FPS, self.framerate)
+            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            if self._test_capture():
+                self.is_initialized = True
+                self.logger.info("Camera initialized successfully")
+            else:
+                raise Exception("Camera test failed")
+        except Exception as e:
+            self.logger.error(f"Camera initialization failed: {e}")
+            self.cleanup()
+            raise
+    
+    def _test_capture(self):
+        try:
+            for i in range(3):
+                ret, frame = self.camera.read()
+                if ret and frame is not None and frame.shape[0] > 0:
+                    return True
+                time.sleep(0.5)
+            return False
+        except Exception:
+            return False
+    
+    def capture_frame(self):
+        if not self.is_initialized or not self.camera:
+            return None
+        
+        try:
+            ret, frame = self.camera.read()
+            if ret and frame is not None and frame.shape[0] > 0:
+                return frame
+            return None
+        except Exception as e:
+            self.logger.error(f"Capture error: {e}")
+            return None
+    
+    def cleanup(self):
+        if self.camera:
+            self.camera.release()
+            self.camera = None
+            self.is_initialized = False
+
+if __name__ == "__main__":
+    camera = CameraHandler()
+    frame = camera.capture_frame()
+    if frame is not None:
+        print(f"Camera test successful: {frame.shape}")
+    else:
+        print("Camera test failed")
+    camera.cleanup()
+EOF
 
 # Create config file
 log "Creating configuration..."
